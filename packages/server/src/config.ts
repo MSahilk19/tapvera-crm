@@ -1,0 +1,279 @@
+import { z } from 'zod';
+
+/**
+ * Environment configuration, validated at boot.
+ *
+ * Fails fast and loudly: a server that starts with a missing secret and
+ * discovers it on the first request has turned a deployment error into an
+ * incident. DP-3 — secrets come from a managed secret store; this module reads
+ * whatever the platform injected, it never holds a default for one.
+ */
+
+/**
+ * `z.coerce.boolean()` is `Boolean(value)`, so the STRING "false" parses as true.
+ * That silently enabled the header-trusting dev bypass and selected implicit TLS
+ * for SMTP whenever an operator wrote `=false`. Booleans are parsed explicitly:
+ * an empty value counts as unset, and anything unrecognised is a startup error.
+ */
+const envBoolean = (fallback: boolean) =>
+  z.preprocess((value) => {
+    if (typeof value !== 'string') return value;
+    const normalised = value.trim().toLowerCase();
+    if (normalised === '') return undefined;
+    if (['true', '1', 'yes', 'on'].includes(normalised)) return true;
+    if (['false', '0', 'no', 'off'].includes(normalised)) return false;
+    return value;
+  }, z.boolean({ invalid_type_error: 'must be true or false' }).default(fallback));
+
+const optionalEnvString = (schema: z.ZodOptional<z.ZodString>) =>
+  z.preprocess((value) => typeof value === 'string' && value.trim() === '' ? undefined : value, schema);
+
+const schema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  IDENTITY_DEV_BYPASS: envBoolean(false),
+  // Local development only: "Forgot password?" on the company login page gives
+  // a company admin a new password on screen, because a laptop has no mailbox
+  // for the reset link. Refused at boot when NODE_ENV=production.
+  DEV_INSTANT_PASSWORD_RESET: envBoolean(false),
+  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+
+  // PG-3 — two distinct roles. The application role owns no tables and cannot
+  // bypass RLS; the migration role owns them and never serves a request.
+  DATABASE_URL: z.string().url(),
+  MIGRATION_DATABASE_URL: z.string().url().optional(),
+  // DP-8 — pool size is budgeted, not guessed.
+  DATABASE_POOL_MAX: z.coerce.number().int().positive().max(100).default(10),
+  DATABASE_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+
+  REDIS_URL: z.string().url(),
+  // ID-9 / SE-5 — brute-force counters and rate limits must be shared across
+  // replicas and survive a deploy. `memory` is a single-process fallback for
+  // local work only, and is refused in production at boot.
+  SECURITY_COUNTER_STORE: z.enum(['redis', 'memory']).default('redis'),
+  // New passwords are checked against Have I Been Pwned (k-anonymity range API).
+  //   best-effort  refuse a breached password; if the service can't be reached,
+  //                accept the password and log a warning (default)
+  //   strict       refuse to set any password while the service can't be reached
+  //   off          only the built-in list of common passwords (air-gapped installs)
+  PASSWORD_BREACH_CHECK: z.enum(['best-effort', 'strict', 'off']).default('best-effort'),
+  // Scanned (image-only) resume PDFs are read with Tesseract OCR, inside this
+  // process: no resume leaves the server. Set false to skip it on servers with
+  // little CPU; such resumes then show a notice and HR types the details.
+  RESUME_OCR: envBoolean(true),
+  // Optional header written by a trusted edge IP-geolocation provider. Empty
+  // means country signals remain unavailable rather than client-controlled.
+  TRUSTED_IP_COUNTRY_HEADER: z.string().trim().default(''),
+
+  S3_ENDPOINT: z.string().url().optional(),
+  /** The storage address browsers reach, for signed download links; defaults to S3_ENDPOINT. */
+  S3_PUBLIC_ENDPOINT: z.string().url().optional(),
+  S3_REGION: z.string().default('us-east-1'),
+  S3_BUCKET: z.string().default('tapcrm-files'),
+  // FS-6 — statutory artifacts go to a write-once bucket with object lock.
+  S3_BUCKET_WORM: z.string().default('tapcrm-worm'),
+  S3_ACCESS_KEY_ID: z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+  S3_FORCE_PATH_STYLE: envBoolean(true),
+  AUDIT_ARCHIVE_ENCRYPTION_KEY: z.string().optional(),
+  AUDIT_ARCHIVE_KEY_ID: optionalEnvString(z.string().trim().min(1).optional()),
+  // JSON object of historical archive key IDs to base64-encoded 32-byte keys.
+  // The active key above remains the only key used for new archives.
+  AUDIT_ARCHIVE_KEYRING_JSON: optionalEnvString(z.string().trim().min(2).optional()),
+
+  JWT_ACCESS_SECRET: z
+    .string()
+    .min(32, 'JWT_ACCESS_SECRET must be at least 32 characters'),
+  JWT_REFRESH_SECRET: z
+    .string()
+    .min(32, 'JWT_REFRESH_SECRET must be at least 32 characters'),
+  // ID-6 — access tokens are short-lived, default 60 minutes.
+  ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
+  REFRESH_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().default(1_209_600),
+
+  // §9.5.1 — the audit writer. A string enum rather than z.coerce.boolean(),
+  // which would read the string "false" as true.
+  AUDIT_DRAINER_ENABLED: z.enum(['true', 'false']).default('true'),
+  AUDIT_DRAIN_INTERVAL_MS: z.coerce.number().int().min(100).default(5_000),
+  AUDIT_DRAIN_BATCH_SIZE: z.coerce.number().int().min(1).max(1_000).default(200),
+
+  // Notification engine. Dispatcher drains notification_outbox; the socket layer
+  // is a best-effort signal on top of the persisted rows.
+  NOTIFICATION_DISPATCHER_ENABLED: z.enum(['true', 'false']).default('true'),
+  NOTIFICATION_DISPATCH_INTERVAL_MS: z.coerce.number().int().min(100).default(2_000),
+
+  API_PORT: z.coerce.number().int().positive().default(4000),
+  API_BASE_PATH: z.string().default('/api'),
+  TAPCRM_UPLOAD_DIR: z.string().trim().min(1).default('storage'),
+  // Not enforced today: there is no CORS middleware, and the web app reaches the
+  // API same-origin through its dev proxy. Emailed links use CLIENT_ORIGIN.
+  CORS_ORIGIN: z.string().default('http://localhost:5173'),
+  CLIENT_ORIGIN: z.string().url().default('http://localhost:5173'),
+  // 
+  EMAIL_TRANSPORT: z.enum(['console', 'smtp']).default('console'),
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().positive().optional(),
+  SMTP_SECURE: envBoolean(false),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASSWORD: z.string().optional(),
+  SMTP_FROM: z.union([z.string().email(), z.literal('')]).optional(),
+
+  // Meta Lead Ads adapter (R1 step 1.7). Signature verification uses the
+  // app secret; webhook subscription uses the verify token. Graph version
+  // is pinned per deployment so a mid-year Facebook change does not
+  // silently alter the field-data shape.
+  META_APP_SECRET: optionalEnvString(z.string().trim().min(16).optional()),
+  META_WEBHOOK_VERIFY_TOKEN: optionalEnvString(z.string().trim().min(8).optional()),
+  META_GRAPH_VERSION: z.string().trim().default('v18.0'),
+
+  // Google Search Console — the rank provider behind the on-page SEO module's
+  // automatic keyword fetching. `off` leaves the jobs registered but inert, so
+  // a laptop without credentials boots clean.
+  //   service-account  a signed JWT assertion; no token expiry to manage, but
+  //                    the service account must be added as a user (Restricted
+  //                    is enough) on every property it reads
+  //   oauth            a refresh token for the account that already owns the
+  //                    properties; no per-property setup, but the consent
+  //                    screen must be published to Production or Google
+  //                    expires the refresh token every 7 days
+  GOOGLE_SEARCH_CONSOLE_AUTH: z.enum(['off', 'service-account', 'oauth']).default('off'),
+  GOOGLE_SERVICE_ACCOUNT_EMAIL: optionalEnvString(z.string().trim().email().optional()),
+  // The PEM from the service-account key file. Newlines may be written as \n.
+  GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: optionalEnvString(z.string().trim().min(1).optional()),
+  GOOGLE_OAUTH_CLIENT_ID: optionalEnvString(z.string().trim().min(1).optional()),
+  GOOGLE_OAUTH_CLIENT_SECRET: optionalEnvString(z.string().trim().min(1).optional()),
+  GOOGLE_OAUTH_REFRESH_TOKEN: optionalEnvString(z.string().trim().min(1).optional()),
+  // Search Console data is incomplete for the last few days. Observations are
+  // taken from a window ending this many days back.
+  GOOGLE_SEARCH_CONSOLE_LAG_DAYS: z.coerce.number().int().min(1).max(30).default(3),
+  // The window's length. A single day is sparse — a keyword with few
+  // impressions goes missing — so the default averages a week, which is how
+  // the Search Console UI is normally read.
+  GOOGLE_SEARCH_CONSOLE_WINDOW_DAYS: z.coerce.number().int().min(1).max(90).default(7),
+});
+
+export type Config = z.infer<typeof schema>;
+
+let cached: Config | null = null;
+
+/** Values that ship in the repository, so anyone can know them. */
+const PLACEHOLDER_SECRET = /^(replace-me|changeme|change-me|tapcrm_local)/i;
+
+/**
+ * Settings that are wrong in every environment. A half-configured integration
+ * is the worst of both worlds: the server boots, and the failure surfaces at
+ * 4am inside a scheduled job instead of at deployment.
+ */
+function configurationProblems(config: Config): string[] {
+  const problems: string[] = [];
+  const missing = (keys: readonly (keyof Config)[]): string[] =>
+    keys.filter((key) => config[key] === undefined).map(String);
+
+  if (config.GOOGLE_SEARCH_CONSOLE_AUTH === 'service-account') {
+    const absent = missing(['GOOGLE_SERVICE_ACCOUNT_EMAIL', 'GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY']);
+    if (absent.length > 0) {
+      problems.push(`GOOGLE_SEARCH_CONSOLE_AUTH=service-account requires ${absent.join(' and ')}`);
+    }
+  }
+  if (config.GOOGLE_SEARCH_CONSOLE_AUTH === 'oauth') {
+    const absent = missing(['GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'GOOGLE_OAUTH_REFRESH_TOKEN']);
+    if (absent.length > 0) {
+      problems.push(`GOOGLE_SEARCH_CONSOLE_AUTH=oauth requires ${absent.join(', ')}`);
+    }
+  }
+  return problems;
+}
+
+/**
+ * Settings that are tolerable on a laptop and dangerous in production. Checked
+ * only there, so local development keeps working on generated values.
+ */
+function productionProblems(config: Config, env: NodeJS.ProcessEnv): string[] {
+  if (config.NODE_ENV !== 'production') return [];
+  const problems: string[] = [];
+  for (const key of ['JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET'] as const) {
+    if (PLACEHOLDER_SECRET.test(config[key])) {
+      problems.push(`${key} is a placeholder value published in the repository`);
+    }
+  }
+  if (config.JWT_ACCESS_SECRET === config.JWT_REFRESH_SECRET) {
+    problems.push('JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must differ');
+  }
+  if (!env['CLIENT_ORIGIN']) {
+    problems.push('CLIENT_ORIGIN must be set; it is the base of every emailed link');
+  }
+  if (config.DEV_INSTANT_PASSWORD_RESET) {
+    problems.push('DEV_INSTANT_PASSWORD_RESET shows new admin passwords on the login page; it is for local development only');
+  }
+  if (config.SECURITY_COUNTER_STORE === 'memory') {
+    problems.push('SECURITY_COUNTER_STORE=memory is single-process; use redis (ID-9, SE-5)');
+  }
+  if (!config.AUDIT_ARCHIVE_ENCRYPTION_KEY || !config.AUDIT_ARCHIVE_KEY_ID) {
+    problems.push('AUDIT_ARCHIVE_ENCRYPTION_KEY and AUDIT_ARCHIVE_KEY_ID must be managed separately in production');
+  }
+  return problems;
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  if (cached) return cached;
+
+  const parsed = schema.safeParse(env);
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((i) => `  ${i.path.join('.')}: ${i.message}`)
+      .join('\n');
+    throw new Error(`Invalid environment configuration:\n${issues}\n\nSee .env.example.`);
+  }
+
+  const incomplete = configurationProblems(parsed.data);
+  if (incomplete.length > 0) {
+    throw new Error(
+      `Incomplete environment configuration:\n${incomplete.map((p) => `  ${p}`).join('\n')}\n\nSee .env.example.`,
+    );
+  }
+
+  const problems = productionProblems(parsed.data, env);
+  if (problems.length > 0) {
+    throw new Error(
+      `Unsafe production configuration:\n${problems.map((p) => `  ${p}`).join('\n')}\n\nSee .env.example.`,
+    );
+  }
+
+  cached = parsed.data;
+  return cached;
+}
+
+/**
+ * PASSWORD_BREACH_CHECK on its own. The password policy runs in places that
+ * never load the whole configuration (unit tests, the password scripts), and
+ * the setting has a safe default, so it is read without requiring every secret.
+ * An invalid value still fails the boot through `loadConfig()`.
+ */
+export function passwordBreachCheckMode(env: NodeJS.ProcessEnv = process.env): Config['PASSWORD_BREACH_CHECK'] {
+  if (cached) return cached.PASSWORD_BREACH_CHECK;
+  const parsed = schema.shape.PASSWORD_BREACH_CHECK.safeParse(env['PASSWORD_BREACH_CHECK']);
+  return parsed.success ? parsed.data : 'best-effort';
+}
+
+/**
+ * RESUME_OCR on its own, for the same reason: resumes are read in tests and
+ * scripts that never load the whole configuration.
+ */
+export function resumeOcrEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (cached) return cached.RESUME_OCR;
+  const parsed = schema.shape.RESUME_OCR.safeParse(env['RESUME_OCR']);
+  return parsed.success ? parsed.data : true;
+}
+
+/** Test-only. */
+export function __resetConfig(): void {
+  cached = null;
+}
+
+/**
+ * Whether the development-only instant password reset is on. It needs the
+ * explicit flag, and never answers in production (where the flag also stops
+ * the API from starting).
+ */
+export function devInstantPasswordResetEnabled(config: Config = loadConfig()): boolean {
+  return config.DEV_INSTANT_PASSWORD_RESET && config.NODE_ENV !== 'production';
+}

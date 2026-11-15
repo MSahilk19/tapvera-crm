@@ -1,0 +1,354 @@
+import type { NextFunction, Request, Response } from 'express';
+import { AuthorizationError, AuthorizationConfigError } from '@tapcrm/authz';
+import { ERROR_CODES, HTTP_STATUS, type ApiErrorBody } from '@tapcrm/contracts';
+import { ApplicationError } from '../../errors.js';
+import {
+  classifyDatabaseError,
+  RetryExhaustedError,
+  AmbiguousCommitError,
+} from '../dal/errors.js';
+import { MissingTenantContextError } from '../dal/context.js';
+import {
+  PlatformAuthenticationError,
+  PlatformForbiddenError,
+  PlatformNotFoundError,
+  PlatformConflictError,
+  PlatformValidationError,
+} from '../errors.js';
+import { ZodError } from 'zod';
+
+/**
+ * The single place an error becomes a status code — TECH.md §8.2, §9.8.
+ *
+ * The distinction this file exists to preserve:
+ *
+ *   403  "Not you."                     → ask for access
+ *   404  "Not visible to this caller."  → client isolation (CP-2)
+ *   422  "Not this record, not yet."    → complete the missing step
+ *   409  state changed underneath you   → refetch and re-apply
+ *   503  the system is saturated        → back off and retry
+ *
+ * FT-2: 503 and 409 are never conflated.
+ */
+
+/**
+ * Raised by a module's state machine. NF-23b keeps this strictly separate from
+ * AuthorizationError: "A 403 means 'not you'; a 422 means 'not this record, not
+ * yet' — with the unmet predicate named."
+ *
+ * SM-4 requires the unmet predicate, and WF-4 explains why: "A 422 without the
+ * unmet predicate produces a support ticket every time."
+ */
+export class NotEligibleError extends Error {
+  readonly code: string;
+  readonly unmet: readonly string[];
+  readonly required: readonly string[] | undefined;
+  readonly actual: unknown;
+
+  constructor(
+    code: string,
+    message: string,
+    details: { unmet: readonly string[]; required?: readonly string[]; actual?: unknown },
+  ) {
+    super(message);
+    this.name = 'NotEligibleError';
+    this.code = code;
+    this.unmet = details.unmet;
+    this.required = details.required;
+    this.actual = details.actual;
+
+    if (details.unmet.length === 0) {
+      throw new Error(
+        'A 422 must name at least one unmet predicate (WF-4). An eligibility failure ' +
+          'the caller cannot act on is a support ticket.',
+      );
+    }
+  }
+}
+
+export class NotFoundError extends Error {
+  constructor(what: string) {
+    super(`${what} not found`);
+    this.name = 'NotFoundError';
+  }
+}
+
+export class ConflictError extends Error {
+  readonly conflictingKey: string | undefined;
+  constructor(message: string, conflictingKey?: string) {
+    super(message);
+    this.name = 'ConflictError';
+    this.conflictingKey = conflictingKey;
+  }
+}
+
+interface Mapped {
+  status: number;
+  body: ApiErrorBody;
+  headers?: Record<string, string>;
+  /** Logged at error level and alerted; the client never sees the detail. */
+  defect?: boolean;
+}
+
+/**
+ * Express body-parser rejects unparseable input by throwing an error carrying
+ * `type: 'entity.parse.failed'` (JSON) or `entity.too.large`. Left uncaught it
+ * reaches the default handler and returns 500, which reads as a server bug for
+ * a client mistake. Map it to 400 with the code the taxonomy already reserves.
+ */
+function isBodyParserError(
+  error: unknown,
+): error is Error & { type: string; status?: number } {
+  if (typeof error !== 'object' || error === null || !('type' in error)) return false;
+  const { type } = error;
+  return typeof type === 'string' && type.startsWith('entity.');
+}
+
+function mapError(error: unknown): Mapped {
+  if (isBodyParserError(error))
+    return {
+      status: HTTP_STATUS.BAD_REQUEST,
+      body: {
+        success: false,
+        code: ERROR_CODES.MALFORMED_REQUEST,
+        message:
+          error.type === 'entity.parse.failed'
+            ? 'Request body is not valid JSON'
+            : error.type === 'entity.too.large'
+              ? 'Request body exceeds the 1MB limit'
+              : `Request body rejected: ${error.type}`,
+      },
+    };
+
+  if (error instanceof PlatformAuthenticationError)
+    return {
+      status: HTTP_STATUS.UNAUTHENTICATED,
+      body: { success: false, code: ERROR_CODES.UNAUTHENTICATED, message: error.message },
+    };
+  if (error instanceof PlatformForbiddenError)
+    return {
+      status: HTTP_STATUS.FORBIDDEN,
+      body: { success: false, code: ERROR_CODES.FORBIDDEN, message: error.message },
+    };
+  if (error instanceof PlatformNotFoundError)
+    return {
+      status: HTTP_STATUS.NOT_FOUND,
+      body: { success: false, code: ERROR_CODES.NOT_FOUND, message: error.message },
+    };
+  if (error instanceof PlatformConflictError)
+    return {
+      status: HTTP_STATUS.CONFLICT,
+      body: { success: false, code: ERROR_CODES.CONFLICT, message: error.message, details: error.conflictingKey ? { fields: { [error.conflictingKey]: error.message } } : undefined },
+    };
+  if (error instanceof PlatformValidationError || error instanceof ZodError)
+    return {
+      status: HTTP_STATUS.UNPROCESSABLE,
+      body: {
+        success: false,
+        code: ERROR_CODES.VALIDATION_FAILED,
+        message: error instanceof ZodError
+          ? error.issues.map((issue) => `${issue.path.join('.') || 'request'}: ${issue.message}`).join(' ')
+          : error.message,
+        details: error instanceof ZodError ? {
+          fields: Object.fromEntries(error.issues.filter((issue) => issue.path.length).map((issue) => [issue.path.join('.'), issue.message])),
+          issues: error.issues.map((issue) => ({ path: issue.path, message: issue.message })),
+        } : undefined,
+      },
+    };
+
+  if (error instanceof ApplicationError)
+    return {
+      status: error.status,
+      body: {
+        success: false,
+        code: error.code,
+        message: error.message,
+        details: error.details,
+      },
+    };
+
+  /* ---- Authorization: 403, or 404 across a client boundary ---- */
+  if (error instanceof AuthorizationError) {
+    // A2 / CP-2 — client isolation returns 404, NEVER 403. A 403 would confirm
+    // the record exists, which is itself a disclosure across the boundary the
+    // constraint defends.
+    if (error.constraintId === 'A2' || error.reason === 'client_boundary') {
+      return {
+        status: HTTP_STATUS.NOT_FOUND,
+        body: { success: false, code: ERROR_CODES.NOT_FOUND, message: 'Not found' },
+      };
+    }
+    return {
+      status: HTTP_STATUS.FORBIDDEN,
+      body: {
+        success: false,
+        code: ERROR_CODES.FORBIDDEN,
+        message: error.message,
+        // NF-13 — "Every permission-denied state explains what is missing and
+        // who can grant it. 'Access denied' with no path forward generates a
+        // support request."
+        details: {
+          action: error.action,
+          constraint: error.constraintId ?? null,
+          remedy: error.constraintId
+            ? `Governed by protected constraint ${error.constraintId}. This is not configurable.`
+            : 'Request this capability from Super Admin or a delegate who holds it.',
+        },
+      },
+    };
+  }
+
+  /* ---- Eligibility: 422 with the unmet predicate named ---- */
+  if (error instanceof NotEligibleError) {
+    return {
+      status: HTTP_STATUS.UNPROCESSABLE,
+      body: {
+        success: false,
+        code: error.code,
+        message: error.message,
+        details: { unmet: error.unmet, required: error.required, actual: error.actual },
+      },
+    };
+  }
+
+  if (error instanceof NotFoundError) {
+    return {
+      status: HTTP_STATUS.NOT_FOUND,
+      body: { success: false, code: ERROR_CODES.NOT_FOUND, message: error.message },
+    };
+  }
+
+  if (error instanceof ConflictError) {
+    return {
+      status: HTTP_STATUS.CONFLICT,
+      body: {
+        success: false,
+        code: ERROR_CODES.CONFLICT,
+        message: error.message,
+        details: error.conflictingKey ? { key: error.conflictingKey } : undefined,
+      },
+    };
+  }
+
+  /* ---- Saturation and ambiguity: 503, never 409 ---- */
+  if (error instanceof RetryExhaustedError) {
+    return {
+      status: HTTP_STATUS.UNAVAILABLE,
+      headers: { 'Retry-After': '2' },
+      body: {
+        success: false,
+        code: ERROR_CODES.SERVICE_UNAVAILABLE,
+        message: 'The system is under contention. Retry shortly.',
+      },
+    };
+  }
+
+  if (error instanceof AmbiguousCommitError) {
+    return {
+      status: HTTP_STATUS.UNAVAILABLE,
+      body: {
+        success: false,
+        code: ERROR_CODES.AMBIGUOUS_OUTCOME,
+        message: error.message,
+        details: { idempotencyKey: error.idempotencyKey },
+      },
+    };
+  }
+
+  /* ---- Defects: deny, but page an engineer ---- */
+  if (
+    error instanceof AuthorizationConfigError ||
+    error instanceof MissingTenantContextError
+  ) {
+    return {
+      status: HTTP_STATUS.INTERNAL,
+      defect: true,
+      body: {
+        success: false,
+        code: ERROR_CODES.INTERNAL_ERROR,
+        message: 'Internal error',
+      },
+    };
+  }
+
+  /* ---- Database ---- */
+  const classified = classifyDatabaseError(error);
+  if (classified.failureClass !== 'unclassified') {
+    const expenseMessage = classified.failureClass === 'check_violation'
+      ? expenseValidationMessage(classified.message)
+      : undefined;
+    return {
+      status: classified.status,
+      defect: classified.engineeringDefect,
+      body: {
+        success: false,
+        code: classified.code,
+        message:
+          classified.status >= 500
+            ? 'Internal error'
+            : expenseMessage ?? (classified.failureClass === 'check_violation'
+              ? 'Some submitted data failed validation. Check the entered values and try again.'
+              : `Request could not be completed: ${classified.failureClass}`),
+      },
+    };
+  }
+
+  return {
+    status: HTTP_STATUS.INTERNAL,
+    defect: true,
+    body: { success: false, code: ERROR_CODES.INTERNAL_ERROR, message: 'Internal error' },
+  };
+}
+
+function expenseValidationMessage(databaseMessage: string): string | undefined {
+  if (!databaseMessage.includes('expense_claim')) return undefined;
+  if (databaseMessage.includes('amount_paise')) return 'Expense amount must be greater than zero and within the supported limit.';
+  if (databaseMessage.includes('remarks')) return 'Expense remarks must be between 3 and 500 characters.';
+  if (databaseMessage.includes('category')) return 'Select a valid expense category.';
+  if (databaseMessage.includes('attachment') && databaseMessage.includes('size_bytes')) return 'Each receipt must be larger than 0 bytes and no bigger than 5 MB.';
+  if (databaseMessage.includes('rejected_reason') || databaseMessage.includes('expense_claim_check') && !databaseMessage.includes('check2')) return 'Rejected expenses require a rejection reason, while pending expenses must not have reviewer details.';
+  if (databaseMessage.includes('pending_review')) return 'A pending expense cannot already have reviewer details. Refresh the page and try again.';
+  if (databaseMessage.includes('approved_reason') || databaseMessage.includes('expense_claim_check2')) return 'An approved expense cannot have a rejection reason.';
+  if (databaseMessage.includes('status')) return 'The expense status change is invalid. Refresh the page and try again.';
+  return 'Expense details failed validation. Check the date, amount, category, remarks, and receipts.';
+}
+
+/** `req.route` is untyped in Express; narrow it rather than trusting `any`. */
+function routePathOf(req: Request): string {
+  const route: unknown = req.route;
+  if (typeof route === 'object' && route !== null && 'path' in route) {
+    const { path } = route;
+    if (typeof path === 'string') return path;
+  }
+  return req.path;
+}
+
+export function errorHandler(
+  error: unknown,
+  req: Request,
+  res: Response,
+  _next: NextFunction,
+): void {
+  const mapped = mapError(error);
+
+  // Observability §13 — "Never log a payslip amount, a deal's commercials, a
+  // notepad body or a geofence coordinate." Only the shape of the failure is
+  // logged, never the record.
+  const log = {
+    level: mapped.defect ? 'error' : 'warn',
+    msg: 'request failed',
+    status: mapped.status,
+    code: mapped.body.code,
+    method: req.method,
+    route: routePathOf(req),
+    requestId: res.getHeader('x-request-id'),
+    defect: mapped.defect ?? false,
+    err: error instanceof Error ? error.message : String(error),
+  };
+  console[mapped.defect ? 'error' : 'warn'](JSON.stringify(log));
+
+  if (mapped.headers) {
+    for (const [key, value] of Object.entries(mapped.headers)) res.setHeader(key, value);
+  }
+  res.status(mapped.status).json(mapped.body);
+}

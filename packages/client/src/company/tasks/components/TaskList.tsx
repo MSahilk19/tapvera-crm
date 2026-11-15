@@ -1,0 +1,666 @@
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { Icon } from '../../../ui/Icon.js';
+import { SkeletonTable } from '../../../ui/components.js';
+import type { TaskListProps, TaskStatus } from '../types/index.js';
+import { TaskPriorityBadge, TaskStatusBadge } from './TaskStatusBadge.js';
+
+const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
+  pending: ['in_progress', 'completed', 'cancelled'],
+  in_progress: ['completed', 'pending', 'cancelled'],
+  completed: ['in_progress', 'pending'],
+  cancelled: ['pending', 'in_progress'],
+};
+
+const TRANSITION_LABELS: Record<TaskStatus, string> = {
+  pending: 'Pending',
+  in_progress: 'In Progress',
+  completed: 'Completed',
+  cancelled: 'Cancelled',
+};
+
+function formatDate(dateValue: string | null): string {
+  if (!dateValue) return '';
+  try {
+    const d = new Date(dateValue);
+    if (isNaN(d.getTime())) return dateValue;
+    return d.toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+  } catch {
+    return dateValue;
+  }
+}
+
+function getInitials(name: string): string {
+  return name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0])
+    .join('')
+    .toUpperCase();
+}
+
+function ExpandableTaskDescription({
+  taskId,
+  description,
+}: {
+  taskId: string;
+  description: string;
+}): React.JSX.Element {
+  const descriptionRef = useRef<HTMLParagraphElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+
+  useEffect(() => {
+    const element = descriptionRef.current;
+    if (!element || expanded) return;
+
+    const measure = () => setHasMore(element.scrollHeight > element.clientHeight + 1);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [description, expanded]);
+
+  return (
+    <div className="mt-1">
+      <p
+        ref={descriptionRef}
+        id={`task-description-${taskId}`}
+        className={`max-w-3xl break-words text-xs leading-relaxed text-app-muted sm:text-sm ${expanded ? '' : 'line-clamp-2'} lg:line-clamp-none`}
+      >
+        {description}
+      </p>
+      {hasMore && (
+        <button
+          type="button"
+          className="mt-1 text-xs font-semibold text-app-accent hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-app-accent lg:hidden"
+          aria-expanded={expanded}
+          aria-controls={`task-description-${taskId}`}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {expanded ? 'Less' : '… More'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+export function TaskList({
+  tasks,
+  loading = false,
+  currentUserId,
+  onTransitionStatus,
+  onEditTask,
+  onAssignTask,
+}: TaskListProps): React.JSX.Element {
+  const [transitioningTaskId, setTransitioningTaskId] = useState<string | null>(null);
+  const [transitionError, setTransitionError] = useState<{
+    taskId: string;
+    message: string;
+  } | null>(null);
+  const [openStatusMenu, setOpenStatusMenu] = useState<string | null>(null);
+  const [openAssigneeTaskId, setOpenAssigneeTaskId] = useState<string | null>(null);
+  const statusMenuRef = useRef<HTMLDivElement>(null);
+  const statusAnchorRef = useRef<HTMLElement | null>(null);
+  const [statusMenuOptions, setStatusMenuOptions] = useState<{
+    taskId: string;
+    transitions: TaskStatus[];
+    assigneeId: string | undefined;
+  } | null>(null);
+  const [statusMenuPosition, setStatusMenuPosition] = useState<{ top: number; left: number } | null>(null);
+
+  function toggleStatusMenu(
+    key: string,
+    taskId: string,
+    transitions: TaskStatus[],
+    assigneeId: string | undefined,
+    anchor: HTMLElement,
+  ) {
+    if (openStatusMenu === key) {
+      setOpenStatusMenu(null);
+      setStatusMenuOptions(null);
+      statusAnchorRef.current = null;
+      return;
+    }
+    statusAnchorRef.current = anchor;
+    setStatusMenuOptions({ taskId, transitions, assigneeId });
+    setStatusMenuPosition(null);
+    setOpenStatusMenu(key);
+  }
+
+  function closeStatusMenu() {
+    setOpenStatusMenu(null);
+    setStatusMenuOptions(null);
+    setStatusMenuPosition(null);
+    statusAnchorRef.current = null;
+  }
+
+  useEffect(() => {
+    if (!openStatusMenu) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (
+        !statusMenuRef.current?.contains(target) &&
+        !statusAnchorRef.current?.contains(target)
+      ) {
+        closeStatusMenu();
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeStatusMenu();
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [openStatusMenu]);
+
+  useLayoutEffect(() => {
+    if (!openStatusMenu || !statusMenuOptions) return;
+    const updatePosition = () => {
+      const anchor = statusAnchorRef.current;
+      if (!anchor?.isConnected) {
+        closeStatusMenu();
+        return;
+      }
+      const rect = anchor.getBoundingClientRect();
+      const width = Math.min(192, window.innerWidth - 16);
+      const height = Math.min(statusMenuOptions.transitions.length * 40 + 8, window.innerHeight - 16);
+      const canOpenBelow = rect.bottom + height + 8 <= window.innerHeight;
+      const top = canOpenBelow ? rect.bottom + 6 : Math.max(8, rect.top - height - 6);
+      const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+      setStatusMenuPosition((current) =>
+        current?.top === top && current.left === left ? current : { top, left },
+      );
+    };
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [openStatusMenu, statusMenuOptions]);
+
+  if (loading) {
+    return <SkeletonTable columns={5} rows={7} />;
+  }
+
+  if (tasks.length === 0) {
+    return (
+      <div className="rounded-2xl border border-dashed border-app-border bg-app-surface/60 px-6 py-10 text-center">
+        <p className="text-sm font-semibold text-app-foreground">No tasks found</p>
+        <p className="mt-1 text-xs text-app-muted">
+          Try adjusting your filters or create a new task.
+        </p>
+      </div>
+    );
+  }
+
+  async function handleTransition(
+    taskId: string,
+    targetStatus: TaskStatus,
+    userId?: string,
+  ) {
+    try {
+      setTransitioningTaskId(taskId);
+      setTransitionError(null);
+      await onTransitionStatus(taskId, targetStatus, userId);
+    } catch (err) {
+      setTransitionError({
+        taskId,
+        message: err instanceof Error ? err.message : 'Failed to transition task status',
+      });
+    } finally {
+      setTransitioningTaskId(null);
+    }
+  }
+
+  return (
+    <div className="space-y-3 lg:space-y-3">
+      {tasks.map((task) => {
+        const isBusy = transitioningTaskId === task.id;
+        const myAssignment = currentUserId
+          ? task.assignees.find((a) => a.id === currentUserId)
+          : undefined;
+        // A task has a global status and an assignee status. In the personal
+        // task view, the status badge must reflect the signed-in user's
+        // assignment status—the same state changed by the widget.
+        const displayedStatus = myAssignment?.status ?? task.status;
+        const availableTransitions = myAssignment
+          ? (VALID_TRANSITIONS[myAssignment.status] ?? [])
+          : (VALID_TRANSITIONS[displayedStatus] ?? []);
+        const statusCellColor = {
+          pending: 'border-amber-500/30 bg-amber-500/10',
+          in_progress: 'border-sky-500/30 bg-sky-500/10',
+          completed: 'border-emerald-500/30 bg-emerald-500/10',
+          cancelled: 'border-neutral-500/30 bg-neutral-500/10',
+        }[displayedStatus];
+        const statusUpdatedByName = myAssignment
+          ? (myAssignment.statusUpdatedByName || task.statusUpdatedByName || task.createdByName || 'Unknown')
+          : (task.statusUpdatedByName || task.createdByName || 'Unknown');
+        const renderOverallStatusControl = (className = '') => (
+          <div
+            className={`relative ${className}`}
+            title={`Status updated by ${statusUpdatedByName}`}
+          >
+            {availableTransitions.length === 0 ? (
+              <TaskStatusBadge status={displayedStatus} />
+            ) : (
+              <>
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={(event) => toggleStatusMenu(
+                    task.id,
+                    task.id,
+                    availableTransitions,
+                    myAssignment?.id,
+                    event.currentTarget,
+                  )}
+                  className="rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-app-accent disabled:opacity-50"
+                  aria-label={myAssignment ? 'Change my task status' : 'Change task status'}
+                  aria-expanded={openStatusMenu === task.id}
+                >
+                  <TaskStatusBadge
+                    status={displayedStatus}
+                    className="cursor-pointer hover:ring-1 hover:ring-app-accent/40"
+                  />
+                </button>
+              </>
+            )}
+          </div>
+        );
+
+        return (
+          <article
+            key={task.id}
+            className={`relative rounded-2xl border border-app-border/80 bg-app-surface p-4 shadow-sm transition-shadow hover:shadow-md sm:px-7 sm:py-6 hover:z-10 ${openStatusMenu === task.id ? 'z-30' : 'z-0'}`}
+          >
+            <div className="flex flex-col gap-3 border-b border-app-border/70 pb-4 lg:flex lg:flex-row lg:items-start lg:justify-between lg:gap-6 lg:border-0 lg:pb-0">
+              <div className="min-w-0 flex-1 rounded-xl bg-app-surface-raised/40 p-3 lg:rounded-none lg:bg-transparent lg:p-0">
+                <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-2 lg:block">
+                  <div className="min-w-0">
+                    <h3 className="break-words text-base font-bold leading-snug tracking-tight text-app-foreground sm:text-lg">
+                      {task.title}
+                    </h3>
+                    {task.description && (
+                      <ExpandableTaskDescription taskId={task.id} description={task.description} />
+                    )}
+                  </div>
+                  <div className="shrink-0 lg:hidden">
+                    {renderOverallStatusControl()}
+                  </div>
+                </div>
+                {task.projectId && (
+                  <p className="mt-2 hidden max-w-full truncate text-xs font-medium text-app-muted lg:block">
+                    {task.projectName ?? 'Unknown project'}
+                  </p>
+                )}
+              </div>
+
+              <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs lg:hidden">
+                <span className="inline-flex items-center gap-1.5 rounded-md border border-app-border/80 bg-app-surface-raised px-2.5 py-1">
+                  <TaskPriorityBadge priority={task.priority} />
+                </span>
+                {task.projectId && (
+                  <span className="max-w-full truncate text-xs font-medium text-app-muted">
+                    {task.projectName ?? 'Unknown project'}
+                  </span>
+                )}
+                {(task.createdAt || task.createdByName) && (
+                  <span className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-app-border/80 bg-app-surface-raised px-3 py-1.5 text-app-muted">
+                    <Icon name="calendar" className="size-3.5 shrink-0" />
+                    <span>Created</span>
+                    {task.createdAt && (
+                      <time className="font-medium text-app-foreground" dateTime={task.createdAt}>
+                        {formatDate(task.createdAt)}
+                      </time>
+                    )}
+                    {task.createdByName && (
+                      <span className="inline-flex items-center gap-1 border-l border-app-border/80 pl-1.5">
+                        <span className="text-app-muted">Created by</span>
+                        <span
+                          className="grid size-4 shrink-0 place-items-center rounded-full bg-app-background text-[8px] font-semibold text-app-muted ring-1 ring-app-border"
+                          aria-hidden="true"
+                        >
+                          {getInitials(task.createdByName)}
+                        </span>
+                        <span className="font-medium text-app-foreground">{task.createdByName}</span>
+                      </span>
+                    )}
+                  </span>
+                )}
+                {task.dueDate && (
+                  <span className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-app-border/80 bg-app-surface-raised px-3 py-1.5 text-app-muted">
+                    <Icon name="clock" className="size-3.5 shrink-0" />
+                    <span>Due</span>
+                    <time className="font-medium text-app-foreground" dateTime={task.dueDate}>
+                      {formatDate(task.dueDate)}
+                    </time>
+                  </span>
+                )}
+              </div>
+
+              <div className="hidden min-w-0 flex-col items-end gap-2 lg:flex lg:shrink-0">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-9 items-center justify-center gap-1 rounded-lg border border-app-border/80 bg-app-surface-raised px-3 py-1">
+                    <TaskPriorityBadge priority={task.priority} />
+                  </span>
+                  {renderOverallStatusControl(
+                    `flex h-9 items-center justify-center rounded-lg border px-3 py-1 ${statusCellColor}`,
+                  )}
+                  {onEditTask && (
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => onEditTask(task)}
+                      className="inline-flex h-9 min-w-20 items-center justify-center gap-1.5 rounded-lg border border-app-border bg-app-surface px-3 text-xs font-medium text-app-foreground shadow-sm transition hover:bg-app-surface-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-app-accent disabled:opacity-50"
+                      aria-label={`Edit task ${task.title}`}
+                    >
+                      <Icon name="pencil" className="size-3.5 text-app-muted" />
+                      Edit
+                    </button>
+                  )}
+                  {onAssignTask && (
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => onAssignTask(task)}
+                      className="inline-flex h-9 min-w-20 items-center justify-center gap-1.5 rounded-lg border border-app-border bg-app-surface px-3 text-xs font-medium text-app-foreground shadow-sm transition hover:bg-app-surface-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-app-accent disabled:opacity-50"
+                      aria-label={`Manage assignees for ${task.title}`}
+                    >
+                      <Icon name="users" className="size-3.5 text-app-muted" />
+                      Assign
+                    </button>
+                  )}
+                </div>
+
+                {(task.createdAt || task.dueDate || task.createdByName) && (
+                  <div className="flex items-center gap-2 text-[11px] text-app-muted">
+                    {(task.createdAt || task.createdByName) && (
+                      <span className="flex h-7 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-app-border/80 bg-app-surface-raised px-2.5 py-1 text-app-muted">
+                        <Icon name="calendar" className="size-3 shrink-0" />
+                        <span>Created</span>
+                        {task.createdAt && (
+                          <time className="font-medium text-app-foreground" dateTime={task.createdAt}>
+                            {formatDate(task.createdAt)}
+                          </time>
+                        )}
+                        {task.createdByName && (
+                          <span className="inline-flex items-center gap-1 border-l border-app-border/80 pl-1.5">
+                            <span className="text-app-muted">Created by</span>
+                            <span
+                              className="grid size-4 shrink-0 place-items-center rounded-full bg-app-background text-[8px] font-semibold text-app-muted ring-1 ring-app-border"
+                              aria-hidden="true"
+                            >
+                              {getInitials(task.createdByName)}
+                            </span>
+                            <span className="font-medium text-app-foreground">{task.createdByName}</span>
+                          </span>
+                        )}
+                      </span>
+                    )}
+                    {task.dueDate && (
+                      <span className="flex h-7 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-app-border/80 bg-app-surface-raised px-2.5 py-1 text-app-muted">
+                        <Icon name="clock" className="size-3 shrink-0" />
+                        <span>Due</span>
+                        <time className="font-medium text-app-foreground" dateTime={task.dueDate}>
+                          {formatDate(task.dueDate)}
+                        </time>
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {transitionError?.taskId === task.id && (
+              <div className="mt-2 text-xs text-app-danger" role="alert">
+                {transitionError.message}
+              </div>
+            )}
+
+            <section className="mt-3 flex flex-col gap-2.5 border-t border-app-border/80 pt-3 text-xs text-app-muted">
+              <div className="flex min-w-0 flex-col gap-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    className="task-assignee-toggle group inline-flex min-h-9 w-full items-center justify-between gap-3 rounded-lg px-2 text-left transition-none hover:bg-app-surface-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-app-accent"
+                    aria-expanded={openAssigneeTaskId === task.id}
+                    aria-controls={`task-assignees-${task.id}`}
+                    onClick={() =>
+                      setOpenAssigneeTaskId(openAssigneeTaskId === task.id ? null : task.id)
+                    }
+                  >
+                    {(() => {
+                      const assignees = task.assignees;
+                      const isExpanded = openAssigneeTaskId === task.id;
+
+                      if (assignees.length === 0) {
+                        return (
+                          <div className="flex items-center gap-2">
+                            <span className="text-[11px] font-medium uppercase tracking-wide text-app-muted group-hover:text-app-foreground">
+                              Assigned to
+                            </span>
+                            <span className="text-xs italic text-app-muted/80">Unassigned</span>
+                          </div>
+                        );
+                      }
+
+                      // Show current user first if assigned, then other assignees
+                      const sortedAssignees = [...assignees].sort((a, b) => {
+                        if (currentUserId && a.id === currentUserId) return -1;
+                        if (currentUserId && b.id === currentUserId) return 1;
+                        return 0;
+                      });
+
+                      const displayedAssignees = sortedAssignees.slice(0, 2);
+                      const remainingCount = assignees.length - 2;
+                      const completedCount = assignees.filter((a) => a.status === 'completed').length;
+
+                      return (
+                        <>
+                          <div className="flex min-w-0 flex-wrap items-center gap-2">
+                            <span className="text-[11px] font-medium uppercase tracking-wide text-app-muted group-hover:text-app-foreground">
+                              Assigned to:
+                            </span>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {displayedAssignees.map((assignee) => {
+                                const isSelf = currentUserId === assignee.id;
+                                return (
+                                  <span
+                                    key={assignee.id}
+                                    className="inline-flex items-center gap-1.5 rounded-full border border-app-border/80 bg-app-surface-raised px-2 py-0.5 text-xs font-medium text-app-foreground"
+                                  >
+                                    <span
+                                      className="grid size-4 shrink-0 place-items-center rounded-full bg-app-background text-[8px] font-semibold text-app-muted ring-1 ring-app-border/60"
+                                      aria-hidden="true"
+                                    >
+                                      {getInitials(assignee.fullName)}
+                                    </span>
+                                    <span className="truncate max-w-[120px] sm:max-w-[180px]">
+                                      {assignee.fullName}{isSelf && ' (You)'}
+                                    </span>
+                                  </span>
+                                );
+                              })}
+                              {remainingCount > 0 && (
+                                <span
+                                  className="inline-flex items-center rounded-full border border-app-accent/30 bg-app-accent/10 px-2 py-0.5 text-[11px] font-semibold text-app-accent transition group-hover:bg-app-accent/20"
+                                  title={`${remainingCount} more assignee${remainingCount > 1 ? 's' : ''}`}
+                                >
+                                  +{remainingCount} others
+                                </span>
+                              )}
+                              <span className="grid size-5 place-items-center rounded text-app-muted transition group-hover:text-app-foreground">
+                                <Icon
+                                  name="chevron-down"
+                                  className={`size-4 transition-transform duration-200 ${
+                                    isExpanded ? 'rotate-180' : ''
+                                  }`}
+                                />
+                              </span>
+                            </div>
+                          </div>
+                          <span className="shrink-0 text-[11px] text-app-muted">
+                            {completedCount} of {assignees.length} complete
+                          </span>
+                        </>
+                      );
+                    })()}
+                  </button>
+                </div>
+                <div
+                  id={`task-assignees-${task.id}`}
+                  className={`${openAssigneeTaskId === task.id ? 'flex' : 'hidden'} min-w-0 flex-col items-stretch gap-2.5`}
+                >
+                  {task.assignees.length === 0 ? (
+                    <span className="text-xs italic text-app-muted/80">Unassigned</span>
+                  ) : (
+                    <>
+                      {[...task.assignees]
+                        .sort((a, b) => {
+                          if (currentUserId && a.id === currentUserId) return -1;
+                          if (currentUserId && b.id === currentUserId) return 1;
+                          return 0;
+                        })
+                        .map((assignee) => {
+                          const isSelf = currentUserId === assignee.id;
+                          const assigneeTransitions =
+                            VALID_TRANSITIONS[assignee.status] ?? [];
+                          return (
+                            <div
+                              key={assignee.id}
+                              className="inline-flex w-full max-w-full flex-wrap items-center justify-between gap-2 rounded-xl border border-app-border/80 bg-app-surface px-2.5 py-2.5 text-xs shadow-sm"
+                            >
+                              <span className="flex min-w-0 flex-1 items-center gap-2">
+                                <span
+                                  className="grid size-8 shrink-0 place-items-center rounded-full bg-app-surface-raised text-[10px] font-semibold text-app-muted"
+                                  aria-hidden="true"
+                                >
+                                  {getInitials(assignee.fullName)}
+                                </span>
+                                <span className="max-w-40 whitespace-normal break-words font-medium text-app-foreground">
+                                  {assignee.fullName} {isSelf && '(You)'}
+                                </span>
+                              </span>
+                              {(() => {
+                                const assigneeUpdater = assignee.statusUpdatedByName || assignee.fullName;
+                                const isMenuOpen = openStatusMenu === `${task.id}:${assignee.id}`;
+                                return (
+                                  <div
+                                    className="relative inline-flex items-center"
+                                    title={`Status updated by ${assigneeUpdater}`}
+                                  >
+                                    {assigneeTransitions.length === 0 ? (
+                                      <TaskStatusBadge status={assignee.status} />
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        disabled={isBusy}
+                                        onClick={(event) => toggleStatusMenu(
+                                          `${task.id}:${assignee.id}`,
+                                          task.id,
+                                          assigneeTransitions,
+                                          assignee.id,
+                                          event.currentTarget,
+                                        )}
+                                        className="disabled:opacity-50"
+                                        aria-label={`Change status for ${assignee.fullName}`}
+                                        aria-expanded={isMenuOpen}
+                                      >
+                                        <TaskStatusBadge
+                                          status={assignee.status}
+                                          className="cursor-pointer hover:ring-1 hover:ring-app-accent/40"
+                                        />
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+                            </div>
+                          );
+                        })}
+                    </>
+                  )}
+                </div>
+              </div>
+            </section>
+
+            <footer className="mt-0 flex gap-2.5 bg-transparent pt-3 lg:hidden">
+              {onEditTask && (
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => onEditTask(task)}
+                  className="inline-flex min-h-10 flex-1 items-center justify-center gap-1.5 rounded-xl bg-app-surface-raised px-4 py-2.5 text-xs font-semibold text-app-foreground transition hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-app-accent disabled:opacity-50"
+                  aria-label={`Edit task ${task.title}`}
+                >
+                  <Icon name="pencil" className="size-4 text-app-muted" />
+                  Edit Task
+                </button>
+              )}
+              {onAssignTask && (
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => onAssignTask(task)}
+                  className="inline-flex min-h-10 flex-1 items-center justify-center gap-1.5 rounded-xl bg-app-accent px-4 py-2.5 text-xs font-semibold text-white transition hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-app-accent disabled:opacity-50"
+                  aria-label={`Manage assignees for ${task.title}`}
+                >
+                  <Icon name="users" className="size-4" />
+                  Assign Member
+                </button>
+              )}
+            </footer>
+          </article>
+        );
+      })}
+      {openStatusMenu && statusMenuOptions && statusMenuPosition && createPortal(
+        <div
+          ref={statusMenuRef}
+          role="menu"
+          className="overflow-y-auto rounded-xl border border-app-border bg-app-surface py-1 text-sm text-app-foreground shadow-2xl"
+          style={{
+            position: 'fixed',
+            zIndex: 10000,
+            top: statusMenuPosition.top,
+            left: statusMenuPosition.left,
+            width: 'min(12rem, calc(100vw - 1rem))',
+            maxHeight: 'calc(100dvh - 1rem)',
+          }}
+        >
+          {statusMenuOptions.transitions.map((status) => (
+            <button
+              key={status}
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                const { taskId, assigneeId } = statusMenuOptions;
+                closeStatusMenu();
+                void handleTransition(taskId, status, assigneeId);
+              }}
+              className="block w-full px-3 py-2.5 text-left hover:bg-app-surface-raised focus-visible:bg-app-surface-raised focus-visible:outline-none"
+            >
+              {TRANSITION_LABELS[status] ?? status}
+            </button>
+          ))}
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+}

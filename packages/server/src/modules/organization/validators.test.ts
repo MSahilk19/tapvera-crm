@@ -1,0 +1,107 @@
+import { describe, expect, it } from 'vitest';
+import {
+  createDepartmentSchema,
+  createPositionSchema,
+  createTeamSchema,
+} from './validators.js';
+
+describe('generic organization validators', () => {
+  it('accepts the PRD department kinds', () => {
+    const result = createDepartmentSchema.safeParse({
+      code: 'engineering',
+      name: 'Engineering',
+      kind: 'delivery',
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects unsupported department kinds', () => {
+    const result = createDepartmentSchema.safeParse({
+      code: 'engineering',
+      name: 'Engineering',
+      kind: 'engineering',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('allows a team to be created before a lead is assigned', () => {
+    const result = createTeamSchema.safeParse({
+      departmentId: '00000000-0000-0000-0000-000000000001',
+      kind: 'sales-team',
+      name: 'Platform Engineering',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.leadUserId).toBeNull();
+  });
+
+  it('rejects unsupported team kinds', () => {
+    const result = createTeamSchema.safeParse({
+      departmentId: '00000000-0000-0000-0000-000000000001',
+      kind: 'functional',
+      name: 'Platform Engineering',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('requires a parent for custom positions', () => {
+    const result = createPositionSchema.safeParse({
+      departmentId: '00000000-0000-0000-0000-000000000001',
+      code: 'engineering-head',
+      name: 'Engineering Head',
+      organizationalLevel: 90,
+      parentPositionId: '00000000-0000-0000-0000-000000000002',
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts a position without a parent: only a department\'s first position may be one, which the service checks', () => {
+    const result = createPositionSchema.safeParse({
+      departmentId: '00000000-0000-0000-0000-000000000001',
+      code: 'engineering-head',
+      name: 'Engineering Head',
+      organizationalLevel: 90,
+      parentPositionId: null,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.data?.parentPositionId).toBeNull();
+    expect(result.data?.adoptLowerPositions).toBe(false);
+  });
+
+  it('accepts one targeted direct-child adoption for inserting a position above it', () => {
+    const result = createPositionSchema.safeParse({
+      departmentId: '00000000-0000-0000-0000-000000000001',
+      code: 'engineering-manager',
+      name: 'Engineering Manager',
+      organizationalLevel: 70,
+      parentPositionId: '00000000-0000-0000-0000-000000000002',
+      adoptPositionIds: ['00000000-0000-0000-0000-000000000003'],
+    });
+    expect(result.success).toBe(true);
+    expect(result.data?.adoptPositionIds).toEqual([
+      '00000000-0000-0000-0000-000000000003',
+    ]);
+  });
+
+  it('rejects ambiguous, duplicate, or inactive targeted adoptions', () => {
+    const input = {
+      departmentId: '00000000-0000-0000-0000-000000000001',
+      code: 'engineering-manager',
+      name: 'Engineering Manager',
+      organizationalLevel: 70,
+      parentPositionId: '00000000-0000-0000-0000-000000000002',
+      adoptPositionIds: ['00000000-0000-0000-0000-000000000003'],
+    };
+    expect(createPositionSchema.safeParse({ ...input, adoptLowerPositions: true }).success)
+      .toBe(false);
+    expect(createPositionSchema.safeParse({
+      ...input,
+      adoptPositionIds: [input.adoptPositionIds[0], input.adoptPositionIds[0]],
+    }).success).toBe(false);
+    expect(createPositionSchema.safeParse({ ...input, status: 'inactive' }).success)
+      .toBe(false);
+  });
+});

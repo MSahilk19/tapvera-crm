@@ -1,0 +1,406 @@
+import { useCallback, useEffect, useState } from 'react';
+import { Button, Notice, WorkspacePageContainer } from '../../../ui/components.js';
+import { getCompanyIdentity } from '../../api/companyApi.js';
+import {
+  assignTask,
+  createTask,
+  listTasks,
+  transitionTask,
+  updateTask,
+} from '../api/tasksApi.js';
+import { TaskFilters } from '../components/TaskFilters.js';
+import { TaskAssignModal, TaskForm } from '../components/TaskForm.js';
+import { TaskList } from '../components/TaskList.js';
+import type {
+  CreateTaskInput,
+  PaginatedTasks,
+  Task,
+  TaskListQuery,
+  TaskStatus,
+  TaskViewScope,
+  UpdateTaskInput,
+} from '../types/index.js';
+
+export interface TasksPageProps {
+  readonly isSuperAdmin?: boolean | undefined;
+  readonly currentUserId?: string | undefined;
+  /** Pre-filters to one project — the "Task Assignment" tab on a project's detail page passes this. */
+  readonly initialProjectId?: string | undefined;
+}
+
+export function TasksPage({
+  isSuperAdmin: propIsSuperAdmin,
+  currentUserId: propCurrentUserId,
+  initialProjectId,
+}: TasksPageProps = {}): React.JSX.Element {
+  const [isSuperAdmin, setIsSuperAdmin] = useState(propIsSuperAdmin ?? false);
+  const [currentUserId, setCurrentUserId] = useState<string | undefined>(
+    propCurrentUserId,
+  );
+  const [viewScope, setViewScope] = useState<TaskViewScope>('my_tasks');
+
+  const [query, setQuery] = useState<TaskListQuery>(() => ({
+    page: 1,
+    pageSize: 20,
+    sortBy: 'createdAt',
+    sortOrder: 'desc',
+    projectId: initialProjectId,
+    participantId: propIsSuperAdmin && propCurrentUserId ? propCurrentUserId : undefined,
+  }));
+  const [data, setData] = useState<PaginatedTasks | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
+  // Modal states
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [assigningTask, setAssigningTask] = useState<Task | null>(null);
+  const [notification, setNotification] = useState<{
+    error?: boolean;
+    message: string;
+  } | null>(null);
+
+  // Resolve identity if not passed as prop
+  useEffect(() => {
+    if (propIsSuperAdmin !== undefined) {
+      setIsSuperAdmin(propIsSuperAdmin);
+      setCurrentUserId(propCurrentUserId);
+      return;
+    }
+    let cancelled = false;
+    void getCompanyIdentity()
+      .then((ident) => {
+        if (!cancelled) {
+          setIsSuperAdmin(ident.user.accountType === 'super-admin');
+          setCurrentUserId(ident.user.id);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [propIsSuperAdmin, propCurrentUserId]);
+
+  // Synchronize participantId with viewScope when identity resolves
+  useEffect(() => {
+    if (isSuperAdmin && currentUserId && viewScope === 'my_tasks') {
+      setQuery((prev) => {
+        if (prev.participantId === currentUserId) return prev;
+        return {
+          ...prev,
+          participantId: currentUserId,
+        };
+      });
+    }
+  }, [isSuperAdmin, currentUserId, viewScope]);
+
+  function handleViewScopeChange(nextScope: TaskViewScope) {
+    setViewScope(nextScope);
+    setQuery((prev) => ({
+      ...prev,
+      participantId: nextScope === 'my_tasks' ? currentUserId : undefined,
+      page: 1,
+    }));
+  }
+
+  const fetchTasks = useCallback(
+    async (overrideQuery?: TaskListQuery) => {
+      try {
+        setLoading(true);
+        setFetchError(null);
+        const result = await listTasks(overrideQuery ?? query);
+        setData(result);
+      } catch (err) {
+        setFetchError(
+          err instanceof Error ? err.message : 'Unable to load company tasks',
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [query],
+  );
+
+  useEffect(() => {
+    void fetchTasks();
+  }, [fetchTasks]);
+
+  // Action handlers
+  async function handleCreateTask(input: CreateTaskInput) {
+    try {
+      const createdTask = await createTask(input);
+      setNotification({ message: 'Task created successfully' });
+
+      // Immediate state update so the new task appears with zero latency
+      setData((prev) => {
+        if (!prev) {
+          return {
+            items: [createdTask],
+            total: 1,
+            page: 1,
+            pageSize: 20,
+            totalPages: 1,
+          };
+        }
+        return {
+          ...prev,
+          items: [
+            createdTask,
+            ...prev.items.filter((item) => item.id !== createdTask.id),
+          ],
+          total: prev.total + 1,
+        };
+      });
+
+      // Synchronize with server
+      await fetchTasks();
+    } catch (err) {
+      setNotification({
+        error: true,
+        message: err instanceof Error ? err.message : 'Failed to create task',
+      });
+      throw err;
+    }
+  }
+
+  async function handleUpdateTask(id: string, input: UpdateTaskInput) {
+    try {
+      const updated = await updateTask(id, input);
+      setNotification({ message: 'Task updated successfully' });
+
+      // Immediate state update
+      setData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          items: prev.items.map((item) => (item.id === id ? updated : item)),
+        };
+      });
+
+      await fetchTasks();
+    } catch (err) {
+      setNotification({
+        error: true,
+        message: err instanceof Error ? err.message : 'Failed to update task',
+      });
+      throw err;
+    }
+  }
+
+  async function handleAssignTask(id: string, assigneeIds: string[]) {
+    try {
+      const updated = await assignTask(id, { assigneeIds });
+      setNotification({ message: 'Assignees updated successfully' });
+
+      // Immediate state update
+      setData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          items: prev.items.map((item) => (item.id === id ? updated : item)),
+        };
+      });
+
+      await fetchTasks();
+    } catch (err) {
+      setNotification({
+        error: true,
+        message: err instanceof Error ? err.message : 'Failed to assign task',
+      });
+      throw err;
+    }
+  }
+
+  async function handleTransitionStatus(
+    taskId: string,
+    status: TaskStatus,
+    userId?: string,
+  ) {
+    try {
+      const updated = await transitionTask(taskId, { status, userId });
+      setNotification({ message: `Task status updated to ${status}` });
+
+      // Immediate state update
+      setData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          items: prev.items.map((item) => (item.id === taskId ? updated : item)),
+        };
+      });
+
+      await fetchTasks();
+    } catch (err) {
+      setNotification({
+        error: true,
+        message:
+          err instanceof Error ? err.message : 'Status transition was rejected by server',
+      });
+      throw err;
+    }
+  }
+
+  // Pagination calculations
+  const total = data?.total ?? 0;
+  const page = data?.page ?? 1;
+  const pageSize = data?.pageSize ?? 20;
+  const totalPages = data?.totalPages ?? 1;
+  const startItem = total === 0 ? 0 : (page - 1) * pageSize + 1;
+  const endItem = Math.min(page * pageSize, total);
+  const visibleTasks = data?.items ?? [];
+  const summary = [
+    { label: 'All tasks', value: total, tone: 'text-app-foreground' },
+    {
+      label: 'Pending',
+      value: visibleTasks.filter((task) => task.status === 'pending').length,
+      tone: 'text-amber-600 dark:text-amber-300',
+    },
+    {
+      label: 'In progress',
+      value: visibleTasks.filter((task) => task.status === 'in_progress').length,
+      tone: 'text-sky-600 dark:text-sky-300',
+    },
+    {
+      label: 'Completed',
+      value: visibleTasks.filter((task) => task.status === 'completed').length,
+      tone: 'text-emerald-600 dark:text-emerald-300',
+    },
+  ];
+
+  return (
+    <WorkspacePageContainer>
+      <div className="space-y-5">
+        {/* Banner notification */}
+        {notification && (
+          <div className="relative">
+            <Notice error={notification.error ?? false}>{notification.message}</Notice>
+            <button
+              type="button"
+              onClick={() => setNotification(null)}
+              className="absolute right-3 top-3 text-xs font-bold text-app-muted hover:text-app-foreground"
+              aria-label="Dismiss notification"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* Compact task summary */}
+        <section
+          aria-label="Task summary"
+          className="grid grid-cols-2 overflow-hidden rounded-2xl border border-app-border/80 bg-app-surface/70 sm:grid-cols-4"
+        >
+          {summary.map((item, index) => (
+            <div
+              key={item.label}
+              className={`px-4 py-3 sm:px-5 ${index > 0 ? 'border-l border-app-border/70' : ''} ${index === 2 ? 'max-sm:border-l-0 max-sm:border-t' : ''} ${index === 3 ? 'max-sm:border-t' : ''}`}
+            >
+              <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-app-muted">
+                {item.label}
+              </p>
+              <p className={`mt-1 text-xl font-semibold tracking-tight ${item.tone}`}>
+                {loading && !data ? '—' : item.value}
+              </p>
+            </div>
+          ))}
+        </section>
+
+        {/* Filters & Search */}
+        <TaskFilters
+          query={query}
+          onQueryChange={(nextQuery) => setQuery(nextQuery)}
+          onCreateTask={() => setIsCreateOpen(true)}
+          disabled={loading}
+          isSuperAdmin={isSuperAdmin}
+          viewScope={viewScope}
+          onViewScopeChange={handleViewScopeChange}
+        />
+
+        {/* Error state with retry */}
+        {fetchError && (
+          <div className="flex flex-col items-start gap-2">
+            <Notice error>{fetchError}</Notice>
+            <Button type="button" kind="secondary" onClick={() => void fetchTasks()}>
+              Retry
+            </Button>
+          </div>
+        )}
+
+        {/* Task List */}
+        <TaskList
+          tasks={data?.items ?? []}
+          loading={loading && !data}
+          currentUserId={currentUserId}
+          onTransitionStatus={handleTransitionStatus}
+          onEditTask={(task) => setEditingTask(task)}
+          onAssignTask={(task) => setAssigningTask(task)}
+        />
+
+        {/* Pagination Footer */}
+        {data && total > 0 && (
+          <div className="flex flex-col items-center justify-between gap-3 pt-4 sm:flex-row">
+            <p className="text-xs text-app-muted">
+              Showing{' '}
+              <span className="font-semibold text-app-foreground">{startItem}</span> to{' '}
+              <span className="font-semibold text-app-foreground">{endItem}</span> of{' '}
+              <span className="font-semibold text-app-foreground">{total}</span> tasks
+            </p>
+
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                kind="secondary"
+                disabled={page <= 1 || loading}
+                onClick={() => setQuery({ ...query, page: page - 1 })}
+                className="py-1 px-3 text-xs"
+                aria-label="Previous page"
+              >
+                Previous
+              </Button>
+              <span className="text-xs font-medium text-app-foreground">
+                Page {page} of {totalPages}
+              </span>
+              <Button
+                type="button"
+                kind="secondary"
+                disabled={page >= totalPages || loading}
+                onClick={() => setQuery({ ...query, page: page + 1 })}
+                className="py-1 px-3 text-xs"
+                aria-label="Next page"
+              >
+                Next
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Create Task Modal */}
+        <TaskForm
+          isOpen={isCreateOpen}
+          mode="create"
+          onSubmitCreate={handleCreateTask}
+          onClose={() => setIsCreateOpen(false)}
+          defaultProjectId={initialProjectId}
+          lockProjectId={Boolean(initialProjectId)}
+        />
+
+        {/* Edit Task Modal */}
+        <TaskForm
+          isOpen={Boolean(editingTask)}
+          mode="edit"
+          initialTask={editingTask}
+          onSubmitUpdate={handleUpdateTask}
+          onClose={() => setEditingTask(null)}
+        />
+
+        {/* Assign Modal */}
+        <TaskAssignModal
+          isOpen={Boolean(assigningTask)}
+          task={assigningTask}
+          onSubmitAssign={handleAssignTask}
+          onClose={() => setAssigningTask(null)}
+        />
+      </div>
+    </WorkspacePageContainer>
+  );
+}
